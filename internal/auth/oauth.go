@@ -22,14 +22,39 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-// OAuth constants from the original gemini-cli.
-// These are "installed application" credentials — the secret is not truly secret.
+// OAuth redirect URLs.
 const (
-	oauthClientID     = "INJECTED_AT_BUILD_TIME"
-	oauthClientSecret = "INJECTED_AT_BUILD_TIME"
-	signInSuccessURL  = "https://developers.google.com/gemini-code-assist/auth_success_gemini"
-	signInFailureURL  = "https://developers.google.com/gemini-code-assist/auth_failure_gemini"
+	signInSuccessURL = "https://developers.google.com/gemini-code-assist/auth_success_gemini"
+	signInFailureURL = "https://developers.google.com/gemini-code-assist/auth_failure_gemini"
 )
+
+// These are set at build time via -ldflags from GitHub Actions secrets:
+//
+//	go build -ldflags="-X github.com/google-gemini/gemini-cli/internal/auth.defaultOAuthClientID=..."
+//
+// For local development, set the GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET env vars.
+var (
+	defaultOAuthClientID     string // injected at build time
+	defaultOAuthClientSecret string // injected at build time
+)
+
+// getOAuthClientID returns the OAuth client ID.
+// Priority: env var → build-time ldflags value.
+func getOAuthClientID() string {
+	if v := os.Getenv("GEMINI_OAUTH_CLIENT_ID"); v != "" {
+		return v
+	}
+	return defaultOAuthClientID
+}
+
+// getOAuthClientSecret returns the OAuth client secret.
+// Priority: env var → build-time ldflags value.
+func getOAuthClientSecret() string {
+	if v := os.Getenv("GEMINI_OAUTH_CLIENT_SECRET"); v != "" {
+		return v
+	}
+	return defaultOAuthClientSecret
+}
 
 var oauthScopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
@@ -54,8 +79,8 @@ type cachedOAuthToken struct {
 // authenticateOAuth performs the full OAuth2 flow.
 func authenticateOAuth() (*Credentials, error) {
 	conf := &oauth2.Config{
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
+		ClientID:     getOAuthClientID(),
+		ClientSecret: getOAuthClientSecret(),
 		Scopes:       oauthScopes,
 		Endpoint:     google.Endpoint,
 	}
@@ -288,8 +313,8 @@ func SaveAPIKey(key string) error {
 // GetAuthURL returns the OAuth URL without starting a server (for display).
 func GetAuthURL() string {
 	conf := &oauth2.Config{
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
+		ClientID:     getOAuthClientID(),
+		ClientSecret: getOAuthClientSecret(),
 		Scopes:       oauthScopes,
 		Endpoint:     google.Endpoint,
 		RedirectURL:  "urn:ietf:wg:oauth:2.0:oob",
@@ -300,8 +325,8 @@ func GetAuthURL() string {
 // ExchangeCode exchanges an authorization code for tokens (manual flow).
 func ExchangeCode(code string) (*Credentials, error) {
 	conf := &oauth2.Config{
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
+		ClientID:     getOAuthClientID(),
+		ClientSecret: getOAuthClientSecret(),
 		Scopes:       oauthScopes,
 		Endpoint:     google.Endpoint,
 		RedirectURL:  "urn:ietf:wg:oauth:2.0:oob",
@@ -329,8 +354,8 @@ func OAuthFlowAsync() (authURL string, resultCh <-chan *Credentials, errCh <-cha
 	errs := make(chan error, 1)
 
 	conf := &oauth2.Config{
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
+		ClientID:     getOAuthClientID(),
+		ClientSecret: getOAuthClientSecret(),
 		Scopes:       oauthScopes,
 		Endpoint:     google.Endpoint,
 	}

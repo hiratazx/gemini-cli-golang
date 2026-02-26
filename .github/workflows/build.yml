@@ -63,7 +63,11 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X main.version=${{ github.ref_name }}"
+          LDFLAGS="$LDFLAGS -X github.com/google-gemini/gemini-cli/internal/auth.defaultOAuthClientID=${{ secrets.OAUTH_CLIENT_ID }}"
+          LDFLAGS="$LDFLAGS -X github.com/google-gemini/gemini-cli/internal/auth.defaultOAuthClientSecret=${{ secrets.OAUTH_CLIENT_SECRET }}"
+          go build -ldflags="$LDFLAGS" \
             -o dist/gemini-cli-${{ matrix.suffix }} \
             ./cmd/gemini
 
