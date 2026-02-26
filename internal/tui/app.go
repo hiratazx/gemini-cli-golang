@@ -322,7 +322,8 @@ func (m Model) updateModelSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.selectedModel = m.models[m.modelCursor].ID
 			m.state = StateChat
-			return m, m.initChat()
+			m.chatInput.Focus()
+			return m, textinput.Blink
 		}
 	}
 	return m, nil
@@ -369,24 +370,6 @@ func (m Model) viewModelSelect() string {
 
 // === Chat State ===
 
-func (m Model) initChat() tea.Cmd {
-	return tea.Batch(
-		func() tea.Msg {
-			ctx := context.Background()
-			client, err := genai.NewClient(ctx, m.creds)
-			if err != nil {
-				return authCompleteMsg{err: err}
-			}
-			_ = client
-			return nil
-		},
-		func() tea.Msg {
-			m.chatInput.Focus()
-			return textinput.Blink
-		},
-	)
-}
-
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -394,8 +377,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		switch msg.String() {
-		case "enter":
+		if msg.String() == "enter" {
 			input := m.chatInput.Value()
 			if input == "" {
 				return m, nil
@@ -408,11 +390,12 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.thinking = ""
 
 			return m, tea.Batch(m.chatSpinner.Tick, m.sendMessage(input))
-		default:
-			var cmd tea.Cmd
-			m.chatInput, cmd = m.chatInput.Update(msg)
-			return m, cmd
 		}
+
+		// Forward all other key presses to the text input
+		var cmd tea.Cmd
+		m.chatInput, cmd = m.chatInput.Update(msg)
+		return m, cmd
 
 	case streamChunkMsg:
 		resp := msg.resp
@@ -462,7 +445,10 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	return m, nil
+	// Forward any other messages (e.g., Blink) to the chat input
+	var cmd tea.Cmd
+	m.chatInput, cmd = m.chatInput.Update(msg)
+	return m, cmd
 }
 
 func (m Model) sendMessage(input string) tea.Cmd {
