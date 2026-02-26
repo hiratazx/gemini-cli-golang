@@ -418,10 +418,12 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tokenInfo = fmt.Sprintf("Tokens: %d in / %d out", resp.InputTokens, resp.OutputTokens)
 		}
 
-		if resp.Done && m.streamText != "" {
+		if resp.Done {
 			m.streaming = false
-			m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
-			m.streamText = ""
+			if m.streamText != "" {
+				m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+				m.streamText = ""
+			}
 			m.thinking = ""
 			m.chatInput.Focus()
 			return m, textinput.Blink
@@ -469,20 +471,20 @@ func (m Model) sendMessage(input string) tea.Cmd {
 
 		ch := client.GenerateContentStream(ctx, m.selectedModel, systemPrompt, history, input)
 
+		// Collect all chunks into a single complete response
+		var fullText string
+		var lastResp genai.StreamResponse
 		for resp := range ch {
-			// We need to send each chunk back to the TUI
-			// Since we're in a cmd, we'll collect and return the full response
 			if resp.Error != nil {
 				return streamChunkMsg{resp: resp}
 			}
-			if resp.Done {
-				return streamDoneMsg{}
-			}
-			// For now, accumulate and return final
-			return streamChunkMsg{resp: resp}
+			fullText += resp.Text
+			lastResp = resp
 		}
 
-		return streamDoneMsg{}
+		lastResp.Text = fullText
+		lastResp.Done = true
+		return streamChunkMsg{resp: lastResp}
 	}
 }
 
