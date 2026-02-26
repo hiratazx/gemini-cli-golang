@@ -16,6 +16,7 @@ import (
 
 	"github.com/google-gemini/gemini-cli/internal/auth"
 	"github.com/google-gemini/gemini-cli/internal/genai"
+	"github.com/google-gemini/gemini-cli/internal/history"
 )
 
 // AppState represents the current state of the application.
@@ -49,15 +50,20 @@ type Model struct {
 	modelCursor int
 
 	// Chat state
-	client       *genai.Client
-	chatInput    textinput.Model
-	messages     []chatMessage
-	streaming    bool
-	streamText   string
-	thinking     string
+	client        *genai.Client
+	chatInput     textinput.Model
+	messages      []chatMessage
+	streaming     bool
+	streamText    string
+	thinking      string
 	selectedModel string
-	tokenInfo    string
-	chatSpinner  spinner.Model
+	tokenInfo     string
+	chatSpinner   spinner.Model
+	showHelp      bool
+	toolStatus    string
+
+	// History
+	session *history.Session
 
 	// Non-interactive mode
 	initialPrompt string
@@ -322,6 +328,7 @@ func (m Model) updateModelSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.selectedModel = m.models[m.modelCursor].ID
 			m.state = StateChat
+			m.session = history.NewSession(m.selectedModel)
 			m.chatInput.Focus()
 			return m, textinput.Blink
 		}
@@ -370,10 +377,62 @@ func (m Model) viewModelSelect() string {
 
 // === Chat State ===
 
+func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
+	cmd := strings.TrimSpace(input)
+	switch {
+	case cmd == "/help":
+		m.showHelp = !m.showHelp
+		m.chatInput.SetValue("")
+		return m, nil, true
+	case cmd == "/clear":
+		m.messages = nil
+		m.tokenInfo = ""
+		m.session = history.NewSession(m.selectedModel)
+		m.chatInput.SetValue("")
+		return m, nil, true
+	case cmd == "/model":
+		m.state = StateModelSelect
+		m.chatInput.SetValue("")
+		return m, nil, true
+	case cmd == "/quit":
+		m.saveHistory()
+		m.state = StateQuitting
+		return m, tea.Quit, true
+	case cmd == "/history":
+		sessions, _ := history.ListSessions(5)
+		if len(sessions) == 0 {
+			m.messages = append(m.messages, chatMessage{role: "system", text: "No conversation history found."})
+		} else {
+			var sb strings.Builder
+			sb.WriteString("**Recent conversations:**\n")
+			for _, s := range sessions {
+				sb.WriteString(fmt.Sprintf("- %s (%s, %d msgs): %s\n",
+					s.CreatedAt.Format("Jan 02 15:04"), s.Model, s.MsgCount, s.Preview))
+			}
+			m.messages = append(m.messages, chatMessage{role: "system", text: sb.String()})
+		}
+		m.chatInput.SetValue("")
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
+func (m *Model) saveHistory() {
+	if m.session != nil && len(m.session.Messages) > 0 {
+		m.session.Save()
+	}
+}
+
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if m.streaming {
+			return m, nil
+		}
+
+		// Dismiss help on any key
+		if m.showHelp {
+			m.showHelp = false
 			return m, nil
 		}
 
@@ -383,11 +442,22 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// Handle slash commands
+			if strings.HasPrefix(input, "/") {
+				if newM, cmd, handled := m.handleSlashCommand(input); handled {
+					return newM, cmd
+				}
+			}
+
 			m.chatInput.SetValue("")
 			m.messages = append(m.messages, chatMessage{role: "user", text: input})
+			if m.session != nil {
+				m.session.AddMessage("user", input)
+			}
 			m.streaming = true
 			m.streamText = ""
 			m.thinking = ""
+			m.toolStatus = ""
 
 			return m, tea.Batch(m.chatSpinner.Tick, m.sendMessage(input))
 		}
@@ -401,10 +471,12 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		resp := msg.resp
 		if resp.Error != nil {
 			m.streaming = false
-			m.streamText += "\n" + errorStyle.Render("Error: "+resp.Error.Error())
-			m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+			m.toolStatus = ""
+			errText := "Error: " + resp.Error.Error()
+			m.messages = append(m.messages, chatMessage{role: "model", text: errText})
 			m.streamText = ""
-			return m, nil
+			m.chatInput.Focus()
+			return m, textinput.Blink
 		}
 
 		if resp.Text != "" {
@@ -420,8 +492,13 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if resp.Done {
 			m.streaming = false
+			m.toolStatus = ""
 			if m.streamText != "" {
 				m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+				if m.session != nil {
+					m.session.AddMessage("model", m.streamText)
+					m.session.Save()
+				}
 				m.streamText = ""
 			}
 			m.thinking = ""
@@ -433,8 +510,13 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamDoneMsg:
 		m.streaming = false
+		m.toolStatus = ""
 		if m.streamText != "" {
 			m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+			if m.session != nil {
+				m.session.AddMessage("model", m.streamText)
+				m.session.Save()
+			}
 			m.streamText = ""
 		}
 		m.thinking = ""
@@ -489,6 +571,11 @@ func (m Model) sendMessage(input string) tea.Cmd {
 }
 
 func (m Model) viewChat() string {
+	// Show help overlay
+	if m.showHelp {
+		return "\n" + HelpContent() + "\n  " + helpDescStyle.Render("Press any key to dismiss") + "\n"
+	}
+
 	var sb strings.Builder
 
 	// Header
@@ -501,28 +588,34 @@ func (m Model) viewChat() string {
 	sb.WriteString("  " + divider(min(m.width-4, 80)) + "\n\n")
 
 	// Messages
-	maxShow := m.height - 10 // Leave room for input and status
+	maxShow := m.height - 10
 	startIdx := 0
 	if len(m.messages) > maxShow/3 {
 		startIdx = len(m.messages) - maxShow/3
 	}
 
 	for _, msg := range m.messages[startIdx:] {
-		if msg.role == "user" {
+		switch msg.role {
+		case "user":
 			sb.WriteString("  " + promptStyle.Render("❯ ") + userMessageStyle.Render(msg.text) + "\n\n")
-		} else {
-			sb.WriteString("  " + modelMessageStyle.Render(msg.text) + "\n\n")
+		case "system":
+			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
+		default:
+			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
 		}
 	}
 
 	// Streaming content
 	if m.streaming {
+		if m.toolStatus != "" {
+			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render(m.toolStatus) + "\n")
+		}
 		if m.thinking != "" {
 			sb.WriteString("  " + thinkingStyle.Render("💭 "+m.thinking) + "\n")
 		}
 		if m.streamText != "" {
-			sb.WriteString("  " + modelMessageStyle.Render(m.streamText))
-		} else {
+			sb.WriteString("  " + RenderMarkdown(m.streamText))
+		} else if m.toolStatus == "" {
 			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render("Thinking..."))
 		}
 		sb.WriteString("\n\n")
@@ -538,7 +631,10 @@ func (m Model) viewChat() string {
 	if m.tokenInfo != "" {
 		statusItems = append(statusItems, m.tokenInfo)
 	}
-	statusItems = append(statusItems, helpKeyStyle.Render("ctrl+c")+" "+helpDescStyle.Render("quit"))
+	statusItems = append(statusItems,
+		helpKeyStyle.Render("/help")+" "+helpDescStyle.Render("commands"),
+		helpKeyStyle.Render("ctrl+c")+" "+helpDescStyle.Render("quit"),
+	)
 
 	sb.WriteString("\n  " + statusInfoStyle.Render(strings.Join(statusItems, "  •  ")) + "\n")
 
@@ -553,8 +649,17 @@ func min(a, b int) int {
 }
 
 // Run starts the TUI application.
-func Run(initialPrompt string) error {
+func Run(initialPrompt string, defaultModel string) error {
 	m := NewModel(initialPrompt)
+	if defaultModel != "" {
+		// Find the model in the list and set it as default
+		for i, model := range m.models {
+			if model.ID == defaultModel {
+				m.modelCursor = i
+				break
+			}
+		}
+	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {
@@ -610,3 +715,4 @@ func RunNonInteractive(prompt string) error {
 
 // Suppress unused import
 var _ = lipgloss.NewStyle
+var _ = history.NewSession
