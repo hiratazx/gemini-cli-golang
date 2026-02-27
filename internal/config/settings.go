@@ -19,6 +19,8 @@ type Settings struct {
 	AutoApproveTools bool `json:"auto_approve_tools,omitempty"`
 	// SaveHistory enables conversation history saving.
 	SaveHistory bool `json:"save_history,omitempty"`
+	// MCPServers configures MCP server connections.
+	MCPServers map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
 }
 
 // DefaultSettings returns settings with sensible defaults.
