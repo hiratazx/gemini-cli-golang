@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/google-gemini/gemini-cli/internal/auth"
+	"github.com/google-gemini/gemini-cli/internal/config"
 	"github.com/google-gemini/gemini-cli/internal/genai"
 	"github.com/google-gemini/gemini-cli/internal/history"
 )
@@ -68,6 +70,10 @@ type Model struct {
 	// History
 	session *history.Session
 
+	// Workspace
+	workDir    string
+	toolBridge *genai.ToolBridge
+
 	// Non-interactive mode
 	initialPrompt string
 }
@@ -109,6 +115,8 @@ func NewModel(initialPrompt string) Model {
 	chatInput.CharLimit = 2000
 	chatInput.Width = 80
 
+	cwd, _ := os.Getwd()
+
 	return Model{
 		state:         StateAuth,
 		authOptions:   auth.GetAuthOptions(),
@@ -118,6 +126,7 @@ func NewModel(initialPrompt string) Model {
 		chatInput:     chatInput,
 		chatSpinner:   cs,
 		initialPrompt: initialPrompt,
+		workDir:       cwd,
 	}
 }
 
@@ -340,6 +349,14 @@ func (m Model) updateModelSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedModel = m.models[m.modelCursor].ID
 			m.state = StateChat
 			m.session = history.NewSession(m.selectedModel)
+
+			// Initialize tool bridge with workspace config
+			cfg := config.NewConfig(config.ConfigParameters{
+				TargetDir: m.workDir,
+				Cwd:       m.workDir,
+			})
+			m.toolBridge = genai.NewToolBridge(cfg)
+
 			m.chatInput.Focus()
 			return m, textinput.Blink
 		case "l", "L":
@@ -431,6 +448,36 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
 			m.messages = append(m.messages, chatMessage{role: "system", text: sb.String()})
 		}
 		m.chatInput.SetValue("")
+		return m, nil, true
+	case strings.HasPrefix(cmd, "/cd"):
+		path := strings.TrimSpace(strings.TrimPrefix(cmd, "/cd"))
+		if path == "" {
+			home, _ := os.UserHomeDir()
+			if home != "" {
+				path = home
+			}
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(m.workDir, path)
+		}
+		path = filepath.Clean(path)
+
+		// Verify directory exists
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			m.messages = append(m.messages, chatMessage{role: "system", text: fmt.Sprintf("Not a directory: %s", path)})
+		} else {
+			m.workDir = path
+			// Reinitialize tool bridge with new directory
+			cfg := config.NewConfig(config.ConfigParameters{
+				TargetDir: m.workDir,
+				Cwd:       m.workDir,
+			})
+			m.toolBridge = genai.NewToolBridge(cfg)
+			m.messages = append(m.messages, chatMessage{role: "system", text: fmt.Sprintf("📂 Changed directory to %s", path)})
+		}
+		m.chatInput.SetValue("")
+		m.updateViewportContent()
 		return m, nil, true
 	}
 	return m, nil, false
@@ -546,6 +593,10 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if resp.Thought != "" {
 			m.thinking = resp.Thought
 		}
+		if resp.ToolStatus != "" {
+			m.toolStatus = resp.ToolStatus
+			m.updateViewportContent()
+		}
 
 		if resp.TotalTokens > 0 {
 			m.tokenInfo = fmt.Sprintf("Tokens: %d in / %d out", resp.InputTokens, resp.OutputTokens)
@@ -606,12 +657,18 @@ func (m Model) sendMessage(input string) tea.Cmd {
 			return streamChunkMsg{resp: genai.StreamResponse{Error: err, Done: true}}
 		}
 
-		cwd, _ := os.Getwd()
-		systemPrompt := genai.GetDefaultSystemPrompt(cwd)
+		// Attach tool bridge if available
+		if m.toolBridge != nil {
+			client.SetToolBridge(m.toolBridge)
+		}
+
+		systemPrompt := genai.GetDefaultSystemPrompt(m.workDir)
 
 		var history []genai.Message
 		for _, msg := range m.messages {
-			history = append(history, genai.Message{Role: msg.role, Text: msg.text})
+			if msg.role == "user" || msg.role == "model" {
+				history = append(history, genai.Message{Role: msg.role, Text: msg.text})
+			}
 		}
 
 		ch := client.GenerateContentStream(ctx, m.selectedModel, systemPrompt, history, input)
@@ -644,6 +701,9 @@ func (m Model) viewChat() string {
 	// Header
 	sb.WriteString("  " + logoGemini)
 	sb.WriteString("  " + statusModelStyle.Render(m.selectedModel))
+	if m.workDir != "" {
+		sb.WriteString("  " + helpDescStyle.Render(m.workDir))
+	}
 	if m.creds != nil && m.creds.Email != "" {
 		sb.WriteString("  " + statusEmailStyle.Render(m.creds.Email))
 	}
