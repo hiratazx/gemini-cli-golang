@@ -38,6 +38,7 @@ func HelpContent() string {
 		{"/help", "Show this help message"},
 		{"/model", "Switch to a different model"},
 		{"/clear", "Clear conversation history"},
+		{"/cd <path>", "Change working directory"},
 		{"/history", "Show conversation history"},
 		{"/quit", "Exit the application"},
 	}
@@ -53,6 +54,7 @@ func HelpContent() string {
 		desc string
 	}{
 		{"Enter", "Send message"},
+		{"PgUp/PgDn", "Scroll chat history"},
 		{"Ctrl+C", "Quit application"},
 		{"↑/↓", "Navigate menus"},
 	}
