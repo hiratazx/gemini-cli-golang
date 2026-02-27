@@ -63,6 +63,7 @@ type Model struct {
 	tokenInfo     string
 	chatSpinner   spinner.Model
 	showHelp      bool
+	showThinking  bool
 	toolStatus    string
 	chatViewport  viewport.Model
 	viewportReady bool
@@ -79,8 +80,9 @@ type Model struct {
 }
 
 type chatMessage struct {
-	role string // "user" or "model"
-	text string
+	role     string // "user", "model", or "system"
+	text     string
+	thinking string // model's thinking/reasoning (hidden by default)
 }
 
 // Message types
@@ -498,6 +500,15 @@ func (m *Model) updateViewportContent() {
 		case "system":
 			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
 		default:
+			// Show thinking if toggled on and message has thinking
+			if m.showThinking && msg.thinking != "" {
+				sb.WriteString("  " + thinkingStyle.Render("💭 Thinking:") + "\n")
+				lines := strings.Split(msg.thinking, "\n")
+				for _, line := range lines {
+					sb.WriteString("    " + thinkingStyle.Render(line) + "\n")
+				}
+				sb.WriteString("\n")
+			}
 			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
 		}
 	}
@@ -506,8 +517,18 @@ func (m *Model) updateViewportContent() {
 		if m.toolStatus != "" {
 			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render(m.toolStatus) + "\n")
 		}
+		// Show truncated thinking (last 3 lines) while streaming
 		if m.thinking != "" {
-			sb.WriteString("  " + thinkingStyle.Render("💭 "+m.thinking) + "\n")
+			lines := strings.Split(m.thinking, "\n")
+			start := 0
+			if len(lines) > 3 {
+				start = len(lines) - 3
+			}
+			for _, line := range lines[start:] {
+				if strings.TrimSpace(line) != "" {
+					sb.WriteString("  " + thinkingStyle.Render("💭 "+line) + "\n")
+				}
+			}
 		}
 		if m.streamText != "" {
 			sb.WriteString("  " + RenderMarkdown(m.streamText))
@@ -531,6 +552,13 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Dismiss help on any key
 		if m.showHelp {
 			m.showHelp = false
+			return m, nil
+		}
+
+		// Tab toggles thinking visibility
+		if msg.String() == "tab" {
+			m.showThinking = !m.showThinking
+			m.updateViewportContent()
 			return m, nil
 		}
 
@@ -606,7 +634,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streaming = false
 			m.toolStatus = ""
 			if m.streamText != "" {
-				m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+				m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText, thinking: m.thinking})
 				if m.session != nil {
 					m.session.AddMessage("model", m.streamText)
 					m.session.Save()
@@ -625,7 +653,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.toolStatus = ""
 		if m.streamText != "" {
-			m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText})
+			m.messages = append(m.messages, chatMessage{role: "model", text: m.streamText, thinking: m.thinking})
 			if m.session != nil {
 				m.session.AddMessage("model", m.streamText)
 				m.session.Save()
@@ -665,7 +693,9 @@ func (m Model) sendMessage(input string) tea.Cmd {
 		systemPrompt := genai.GetDefaultSystemPrompt(m.workDir)
 
 		var history []genai.Message
-		for _, msg := range m.messages {
+		// Exclude the last message (current input) - buildContents adds it separately
+		msgsForHistory := m.messages[:len(m.messages)-1]
+		for _, msg := range msgsForHistory {
 			if msg.role == "user" || msg.role == "model" {
 				history = append(history, genai.Message{Role: msg.role, Text: msg.text})
 			}
@@ -766,6 +796,7 @@ func (m Model) viewChat() string {
 		statusItems = append(statusItems, helpDescStyle.Render(scrollHint))
 	}
 	statusItems = append(statusItems,
+		helpKeyStyle.Render("Tab")+helpDescStyle.Render(" thinking"),
 		helpKeyStyle.Render("PgUp/Dn")+helpDescStyle.Render(" scroll"),
 		helpKeyStyle.Render("/help")+helpDescStyle.Render(" cmds"),
 		helpKeyStyle.Render("ctrl+c")+helpDescStyle.Render(" quit"),
