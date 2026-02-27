@@ -281,6 +281,21 @@ func ClearCachedCredentials() error {
 	return os.Remove(credsCachePath())
 }
 
+// ClearAPIKey removes the cached API key.
+func ClearAPIKey() error {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return nil
+	}
+	return os.Remove(filepath.Join(home, ".gemini", "api_key"))
+}
+
+// Logout clears all cached credentials (OAuth + API key).
+func Logout() {
+	ClearCachedCredentials()
+	ClearAPIKey()
+}
+
 // HasCachedCredentials checks if cached OAuth credentials exist.
 func HasCachedCredentials() bool {
 	_, err := os.Stat(credsCachePath())
