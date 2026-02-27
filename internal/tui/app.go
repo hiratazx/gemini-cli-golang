@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -61,6 +62,8 @@ type Model struct {
 	chatSpinner   spinner.Model
 	showHelp      bool
 	toolStatus    string
+	chatViewport  viewport.Model
+	viewportReady bool
 
 	// History
 	session *history.Session
@@ -146,6 +149,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.chatInput.Width = msg.Width - 6
+		// Update viewport size (leave room for header=3, input=2, status=3 lines)
+		vpHeight := msg.Height - 8
+		if vpHeight < 3 {
+			vpHeight = 3
+		}
+		m.chatViewport.Width = msg.Width - 4
+		m.chatViewport.Height = vpHeight
+		m.viewportReady = true
 		return m, nil
 
 	case tea.KeyMsg:
@@ -306,7 +317,7 @@ func (m Model) viewAuth() string {
 		}
 	}
 
-	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select • ctrl+c quit") + "\n")
+	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select • L logout • ctrl+c quit") + "\n")
 
 	return sb.String()
 }
@@ -331,6 +342,13 @@ func (m Model) updateModelSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.session = history.NewSession(m.selectedModel)
 			m.chatInput.Focus()
 			return m, textinput.Blink
+		case "l", "L":
+			// Logout: clear credentials and go back to auth
+			auth.Logout()
+			m.creds = nil
+			m.state = StateAuth
+			m.authError = ""
+			return m, m.authSpinner.Tick
 		}
 	}
 	return m, nil
@@ -389,6 +407,7 @@ func (m Model) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
 		m.tokenInfo = ""
 		m.session = history.NewSession(m.selectedModel)
 		m.chatInput.SetValue("")
+		m.updateViewportContent()
 		return m, nil, true
 	case cmd == "/model":
 		m.state = StateModelSelect
@@ -421,6 +440,38 @@ func (m *Model) saveHistory() {
 	if m.session != nil && len(m.session.Messages) > 0 {
 		m.session.Save()
 	}
+}
+
+func (m *Model) updateViewportContent() {
+	var sb strings.Builder
+	for _, msg := range m.messages {
+		switch msg.role {
+		case "user":
+			sb.WriteString("  " + promptStyle.Render("❯ ") + userMessageStyle.Render(msg.text) + "\n\n")
+		case "system":
+			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
+		default:
+			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
+		}
+	}
+
+	if m.streaming {
+		if m.toolStatus != "" {
+			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render(m.toolStatus) + "\n")
+		}
+		if m.thinking != "" {
+			sb.WriteString("  " + thinkingStyle.Render("💭 "+m.thinking) + "\n")
+		}
+		if m.streamText != "" {
+			sb.WriteString("  " + RenderMarkdown(m.streamText))
+		} else if m.toolStatus == "" {
+			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render("Thinking..."))
+		}
+		sb.WriteString("\n\n")
+	}
+
+	m.chatViewport.SetContent(sb.String())
+	m.chatViewport.GotoBottom()
 }
 
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -458,8 +509,17 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamText = ""
 			m.thinking = ""
 			m.toolStatus = ""
+			m.updateViewportContent()
 
 			return m, tea.Batch(m.chatSpinner.Tick, m.sendMessage(input))
+		}
+
+		// Handle scroll keys: forward to viewport
+		switch msg.String() {
+		case "pgup", "pgdown", "home", "end":
+			var vpCmd tea.Cmd
+			m.chatViewport, vpCmd = m.chatViewport.Update(msg)
+			return m, vpCmd
 		}
 
 		// Forward all other key presses to the text input
@@ -475,6 +535,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			errText := "Error: " + resp.Error.Error()
 			m.messages = append(m.messages, chatMessage{role: "model", text: errText})
 			m.streamText = ""
+			m.updateViewportContent()
 			m.chatInput.Focus()
 			return m, textinput.Blink
 		}
@@ -502,6 +563,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.streamText = ""
 			}
 			m.thinking = ""
+			m.updateViewportContent()
 			m.chatInput.Focus()
 			return m, textinput.Blink
 		}
@@ -520,6 +582,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamText = ""
 		}
 		m.thinking = ""
+		m.updateViewportContent()
 		m.chatInput.Focus()
 		return m, textinput.Blink
 
@@ -585,41 +648,44 @@ func (m Model) viewChat() string {
 		sb.WriteString("  " + statusEmailStyle.Render(m.creds.Email))
 	}
 	sb.WriteString("\n")
-	sb.WriteString("  " + divider(min(m.width-4, 80)) + "\n\n")
+	sb.WriteString("  " + divider(min(m.width-4, 80)) + "\n")
 
-	// Messages
-	maxShow := m.height - 10
-	startIdx := 0
-	if len(m.messages) > maxShow/3 {
-		startIdx = len(m.messages) - maxShow/3
-	}
-
-	for _, msg := range m.messages[startIdx:] {
+	// Build message content for viewport
+	var msgContent strings.Builder
+	for _, msg := range m.messages {
 		switch msg.role {
 		case "user":
-			sb.WriteString("  " + promptStyle.Render("❯ ") + userMessageStyle.Render(msg.text) + "\n\n")
+			msgContent.WriteString("  " + promptStyle.Render("❯ ") + userMessageStyle.Render(msg.text) + "\n\n")
 		case "system":
-			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
+			msgContent.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
 		default:
-			sb.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
+			msgContent.WriteString("  " + RenderMarkdown(msg.text) + "\n\n")
 		}
 	}
 
 	// Streaming content
 	if m.streaming {
 		if m.toolStatus != "" {
-			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render(m.toolStatus) + "\n")
+			msgContent.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render(m.toolStatus) + "\n")
 		}
 		if m.thinking != "" {
-			sb.WriteString("  " + thinkingStyle.Render("💭 "+m.thinking) + "\n")
+			msgContent.WriteString("  " + thinkingStyle.Render("💭 "+m.thinking) + "\n")
 		}
 		if m.streamText != "" {
-			sb.WriteString("  " + RenderMarkdown(m.streamText))
+			msgContent.WriteString("  " + RenderMarkdown(m.streamText))
 		} else if m.toolStatus == "" {
-			sb.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render("Thinking..."))
+			msgContent.WriteString("  " + m.chatSpinner.View() + " " + thinkingStyle.Render("Thinking..."))
 		}
-		sb.WriteString("\n\n")
+		msgContent.WriteString("\n\n")
 	}
+
+	// Render messages in viewport area
+	if m.viewportReady {
+		sb.WriteString(m.chatViewport.View())
+	} else {
+		sb.WriteString(msgContent.String())
+	}
+	sb.WriteString("\n")
 
 	// Input
 	if !m.streaming {
@@ -631,12 +697,21 @@ func (m Model) viewChat() string {
 	if m.tokenInfo != "" {
 		statusItems = append(statusItems, m.tokenInfo)
 	}
+	scrollHint := ""
+	if m.viewportReady && m.chatViewport.TotalLineCount() > m.chatViewport.Height {
+		pct := m.chatViewport.ScrollPercent()
+		scrollHint = fmt.Sprintf("%.0f%%", pct*100)
+	}
+	if scrollHint != "" {
+		statusItems = append(statusItems, helpDescStyle.Render(scrollHint))
+	}
 	statusItems = append(statusItems,
-		helpKeyStyle.Render("/help")+" "+helpDescStyle.Render("commands"),
-		helpKeyStyle.Render("ctrl+c")+" "+helpDescStyle.Render("quit"),
+		helpKeyStyle.Render("PgUp/Dn")+helpDescStyle.Render(" scroll"),
+		helpKeyStyle.Render("/help")+helpDescStyle.Render(" cmds"),
+		helpKeyStyle.Render("ctrl+c")+helpDescStyle.Render(" quit"),
 	)
 
-	sb.WriteString("\n  " + statusInfoStyle.Render(strings.Join(statusItems, "  •  ")) + "\n")
+	sb.WriteString("  " + statusInfoStyle.Render(strings.Join(statusItems, "  •  ")) + "\n")
 
 	return sb.String()
 }
