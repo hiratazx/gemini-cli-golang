@@ -317,7 +317,7 @@ func (m Model) viewAuth() string {
 		}
 	}
 
-	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select • L logout • ctrl+c quit") + "\n")
+	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select • ctrl+c quit") + "\n")
 
 	return sb.String()
 }
@@ -388,7 +388,7 @@ func (m Model) viewModelSelect() string {
 		}
 	}
 
-	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select") + "\n")
+	sb.WriteString("\n  " + helpDescStyle.Render("↑/↓ navigate • enter select • L logout • ctrl+c quit") + "\n")
 
 	return sb.String()
 }
