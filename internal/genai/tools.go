@@ -8,14 +8,17 @@ import (
 	"fmt"
 
 	"github.com/google-gemini/gemini-cli/internal/config"
+	"github.com/google-gemini/gemini-cli/internal/core"
+	"github.com/google-gemini/gemini-cli/internal/mcp"
 	"github.com/google-gemini/gemini-cli/internal/tools"
 	"google.golang.org/genai"
 )
 
 // ToolBridge bridges the GenAI SDK function calling with the tool registry.
 type ToolBridge struct {
-	registry *tools.ToolRegistry
-	cfg      *config.Config
+	registry   *tools.ToolRegistry
+	cfg        *config.Config
+	mcpClients []*mcp.MCPClient
 }
 
 // NewToolBridge creates a new ToolBridge.
@@ -32,6 +35,103 @@ func NewToolBridge(cfg *config.Config) *ToolBridge {
 	reg.RegisterTool(tools.NewLSTool(cfg))
 
 	return &ToolBridge{registry: reg, cfg: cfg}
+}
+
+// AddMCPServer connects to an MCP server and registers its tools.
+func (tb *ToolBridge) AddMCPServer(ctx context.Context, name, command string, args []string, env []string) error {
+	client := mcp.NewMCPClient(name)
+	if err := client.Connect(ctx, command, args, env); err != nil {
+		return fmt.Errorf("connect to MCP server %q: %w", name, err)
+	}
+
+	mcpTools, err := client.ListTools(ctx)
+	if err != nil {
+		client.Close()
+		return fmt.Errorf("list tools from %q: %w", name, err)
+	}
+
+	// Register each MCP tool as a DeclarativeTool wrapper
+	for _, t := range mcpTools {
+		wrapper := &mcpToolWrapper{
+			client:     client,
+			name:       t.Name,
+			desc:       t.Description,
+			schema:     t.InputSchema,
+			serverName: name,
+		}
+		tb.registry.RegisterTool(wrapper)
+	}
+
+	tb.mcpClients = append(tb.mcpClients, client)
+	return nil
+}
+
+// Close shuts down all MCP clients.
+func (tb *ToolBridge) Close() {
+	for _, c := range tb.mcpClients {
+		c.Close()
+	}
+}
+
+// mcpToolWrapper wraps an MCP tool as a DeclarativeTool.
+type mcpToolWrapper struct {
+	client     *mcp.MCPClient
+	name       string
+	desc       string
+	schema     map[string]interface{}
+	serverName string
+}
+
+func (w *mcpToolWrapper) Name() string        { return w.name }
+func (w *mcpToolWrapper) DisplayName() string  { return fmt.Sprintf("%s (%s)", w.name, w.serverName) }
+func (w *mcpToolWrapper) Description() string  { return w.desc }
+func (w *mcpToolWrapper) Kind() tools.Kind     { return tools.KindExecute }
+
+func (w *mcpToolWrapper) GetSchema(_ string) core.FunctionDeclaration {
+	return core.FunctionDeclaration{
+		Name:                 w.name,
+		Description:          w.desc,
+		ParametersJSONSchema: w.schema,
+	}
+}
+
+func (w *mcpToolWrapper) CreateInvocation(args map[string]interface{}) (tools.ToolInvocation, error) {
+	return &mcpInvocation{client: w.client, name: w.name, args: args, displayName: w.DisplayName()}, nil
+}
+
+// mcpInvocation wraps an MCP tool call.
+type mcpInvocation struct {
+	client      *mcp.MCPClient
+	name        string
+	args        map[string]interface{}
+	displayName string
+}
+
+func (inv *mcpInvocation) GetDescription() string         { return fmt.Sprintf("Call MCP tool: %s", inv.displayName) }
+func (inv *mcpInvocation) ToolLocations() []tools.ToolLocation { return nil }
+
+func (inv *mcpInvocation) Execute(ctx context.Context) (*tools.ToolResult, error) {
+	result, err := inv.client.CallTool(ctx, inv.name, inv.args)
+	if err != nil {
+		return tools.ErrorResult(tools.ToolErrorTypeGeneral, err.Error()), nil
+	}
+
+	text := result.GetText()
+	if result.IsError {
+		return tools.ErrorResult(tools.ToolErrorTypeGeneral, text), nil
+	}
+
+	return &tools.ToolResult{
+		LLMContent:    text,
+		ReturnDisplay: truncate(text, 80),
+	}, nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
 }
 
 // GetFunctionDeclarations returns GenAI SDK tool declarations.
