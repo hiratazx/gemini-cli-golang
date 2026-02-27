@@ -17,8 +17,9 @@ import (
 
 // Client wraps the Google GenAI SDK client.
 type Client struct {
-	client *genai.Client
-	creds  *auth.Credentials
+	client     *genai.Client
+	creds      *auth.Credentials
+	toolBridge *ToolBridge
 }
 
 // NewClient creates a new GenAI client from credentials.
@@ -54,6 +55,18 @@ func NewClient(ctx context.Context, creds *auth.Credentials) (*Client, error) {
 	return &Client{client: client, creds: creds}, nil
 }
 
+// SetToolBridge attaches a tool bridge for function calling.
+func (c *Client) SetToolBridge(tb *ToolBridge) {
+	c.toolBridge = tb
+}
+
+// FunctionCallInfo holds information about a function call from the model.
+type FunctionCallInfo struct {
+	Name string
+	Args map[string]interface{}
+	ID   string
+}
+
 // StreamResponse holds a chunk of streaming response.
 type StreamResponse struct {
 	Text         string
@@ -62,6 +75,10 @@ type StreamResponse struct {
 	FinishReason string
 	Error        error
 
+	// Tool calls
+	FunctionCalls []FunctionCallInfo
+	ToolStatus    string // status message for tool execution
+
 	// Token usage
 	InputTokens  int
 	OutputTokens int
@@ -69,6 +86,8 @@ type StreamResponse struct {
 }
 
 // GenerateContentStream sends a message and streams the response.
+// It handles function call loops: if the model calls tools, it executes them
+// and sends results back automatically.
 func (c *Client) GenerateContentStream(ctx context.Context, model string, systemInstruction string, history []Message, message string) <-chan StreamResponse {
 	ch := make(chan StreamResponse, 100)
 
@@ -76,12 +95,34 @@ func (c *Client) GenerateContentStream(ctx context.Context, model string, system
 		defer close(ch)
 
 		contents := buildContents(history, message)
+		c.streamWithToolLoop(ctx, model, systemInstruction, contents, ch)
+	}()
 
-		config := &genai.GenerateContentConfig{
-			SystemInstruction: &genai.Content{
-				Parts: []*genai.Part{genai.NewPartFromText(systemInstruction)},
-			},
-		}
+	return ch
+}
+
+// streamWithToolLoop handles the generate → tool call → generate loop.
+func (c *Client) streamWithToolLoop(ctx context.Context, model string, systemInstruction string, contents []*genai.Content, ch chan<- StreamResponse) {
+	config := &genai.GenerateContentConfig{
+		SystemInstruction: &genai.Content{
+			Parts: []*genai.Part{genai.NewPartFromText(systemInstruction)},
+		},
+	}
+
+	// Add tool declarations if bridge is available
+	if c.toolBridge != nil {
+		config.Tools = c.toolBridge.GetFunctionDeclarations(model)
+	}
+
+	maxToolRounds := 10
+
+	for round := 0; round < maxToolRounds; round++ {
+		// Accumulate the full response to detect function calls
+		var allText string
+		var allThought string
+		var functionCalls []FunctionCallInfo
+		var lastTokenInfo StreamResponse
+		var responseParts []*genai.Part
 
 		result := c.client.Models.GenerateContentStream(ctx, model, contents, config)
 
@@ -97,6 +138,7 @@ func (c *Client) GenerateContentStream(ctx context.Context, model string, system
 				sr.InputTokens = int(resp.UsageMetadata.PromptTokenCount)
 				sr.OutputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
 				sr.TotalTokens = int(resp.UsageMetadata.TotalTokenCount)
+				lastTokenInfo = sr
 			}
 
 			if len(resp.Candidates) > 0 {
@@ -107,24 +149,122 @@ func (c *Client) GenerateContentStream(ctx context.Context, model string, system
 
 				if candidate.Content != nil {
 					for _, part := range candidate.Content.Parts {
+						responseParts = append(responseParts, part)
+
 						if part.Text != "" {
 							if part.Thought {
 								sr.Thought = part.Text
+								allThought = part.Text
 							} else {
 								sr.Text = part.Text
+								allText += part.Text
 							}
+						}
+
+						if part.FunctionCall != nil {
+							fc := FunctionCallInfo{
+								Name: part.FunctionCall.Name,
+								ID:   part.FunctionCall.ID,
+							}
+							if part.FunctionCall.Args != nil {
+								fc.Args = part.FunctionCall.Args
+							}
+							functionCalls = append(functionCalls, fc)
 						}
 					}
 				}
 			}
 
-			ch <- sr
+			// Send text/thought chunks as they arrive (but not Done yet)
+			if sr.Text != "" || sr.Thought != "" {
+				ch <- sr
+			}
 		}
 
-		ch <- StreamResponse{Done: true}
-	}()
+		// No function calls → we're done
+		if len(functionCalls) == 0 {
+			ch <- StreamResponse{
+				Done:         true,
+				InputTokens:  lastTokenInfo.InputTokens,
+				OutputTokens: lastTokenInfo.OutputTokens,
+				TotalTokens:  lastTokenInfo.TotalTokens,
+			}
+			return
+		}
 
-	return ch
+		// Execute function calls
+		if c.toolBridge == nil {
+			ch <- StreamResponse{
+				Text: "\n\n⚠️ Model requested tool calls but no tool bridge is configured.",
+				Done: true,
+			}
+			return
+		}
+
+		// Add model's response (with function calls) to contents
+		contents = append(contents, &genai.Content{
+			Role:  "model",
+			Parts: responseParts,
+		})
+
+		// Execute each function call and collect results
+		var resultParts []*genai.Part
+		for _, fc := range functionCalls {
+			displayName := c.toolBridge.GetToolDisplayName(fc.Name)
+			ch <- StreamResponse{
+				ToolStatus: fmt.Sprintf("🔧 %s", displayName),
+			}
+
+			toolResult, err := c.toolBridge.ExecuteFunctionCall(ctx, fc.Name, fc.Args)
+
+			var responseData map[string]interface{}
+			if err != nil {
+				responseData = map[string]interface{}{
+					"error": err.Error(),
+				}
+			} else if toolResult.Error != nil {
+				responseData = map[string]interface{}{
+					"error": toolResult.Error.Message,
+				}
+			} else {
+				responseData = map[string]interface{}{
+					"result": toolResult.LLMContent,
+				}
+			}
+
+			resultParts = append(resultParts, &genai.Part{
+				FunctionResponse: &genai.FunctionResponse{
+					Name:     fc.Name,
+					Response: responseData,
+					ID:       fc.ID,
+				},
+			})
+
+			// Show tool result summary
+			summary := ""
+			if toolResult != nil && toolResult.ReturnDisplay != "" {
+				summary = toolResult.ReturnDisplay
+			}
+			ch <- StreamResponse{
+				ToolStatus: fmt.Sprintf("✓ %s → %s", displayName, summary),
+			}
+		}
+
+		// Add tool results to contents
+		contents = append(contents, &genai.Content{
+			Role:  "user",
+			Parts: resultParts,
+		})
+
+		// Clear accumulated text for next round
+		_ = allText
+		_ = allThought
+	}
+
+	ch <- StreamResponse{
+		Text: "\n\n⚠️ Maximum tool call rounds reached.",
+		Done: true,
+	}
 }
 
 // GenerateContent sends a message and returns the full response (non-streaming).
@@ -180,10 +320,16 @@ func GetDefaultSystemPrompt(cwd string) string {
 	sb.WriteString(fmt.Sprintf("- Working directory: %s\n", cwd))
 	sb.WriteString(fmt.Sprintf("- OS: %s/%s\n", runtime.GOOS, runtime.GOARCH))
 	sb.WriteString("\n")
+	sb.WriteString("## Tools\n")
+	sb.WriteString("You have access to tools for reading files, writing files, editing files, ")
+	sb.WriteString("running shell commands, searching files with grep, finding files with glob, ")
+	sb.WriteString("and listing directories. Use them when the user asks about files or code.\n\n")
 	sb.WriteString("## Guidelines\n")
 	sb.WriteString("- Be concise and helpful.\n")
 	sb.WriteString("- Use markdown formatting in responses.\n")
 	sb.WriteString("- When showing code, use fenced code blocks with the language.\n")
+	sb.WriteString("- Use tools to read files before answering questions about code.\n")
+	sb.WriteString("- Use the edit tool for targeted changes, write_new_file for new files.\n")
 	return sb.String()
 }
 
